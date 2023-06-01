@@ -181,6 +181,7 @@ class Robot:
 
     async def _when_motor_stalled_handler(self, packet: Packet):
         self._disable_motors = True
+        print("MOTOR STALL")
         for event in self._when_motor_stalled:
             self.motor_stall.motor = packet.payload[4]
             self.motor_stall.cause = packet.payload[5]
@@ -325,6 +326,23 @@ class Robot:
         await self._backend.write_packet(Packet(dev, cmd, inc, bytes([board])))
         packet = await completer.wait(self.DEFAULT_TIMEOUT)
         return packet.payload[: 10] if packet else []
+    
+    async def get_stall_state(self):
+        dev, cmd, inc = 1, 29, self.inc
+        completer = Completer()
+        self._responses[(dev, cmd, inc)] = completer
+        await self._backend.write_packet(Packet(dev, cmd, inc))
+        packet = await completer.wait(self.DEFAULT_TIMEOUT)
+        return packet.payload[: 8] if packet else []
+        # if packet:
+        #     payload = packet.payload
+        #     timestamp = unpack('>I', payload[0:4])[0]
+        #     data = [
+        #         unpack('>B', payload[5])[0],
+        #         unpack('>B', payload[6])[0]
+        #     ]
+        #     return payload
+        # return None
 
     async def set_name(self, name: str):
         """Set robot name."""

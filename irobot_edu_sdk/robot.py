@@ -475,7 +475,7 @@ class Robot:
         completer = Completer()
         self._responses[(dev, cmd, inc)] = completer
         await self._backend.write_packet(Packet(dev, cmd, inc, payload))
-        await completer.wait(self.DEFAULT_TIMEOUT + int(abs(duration)))
+        await completer.wait(int(abs(duration)))
 
     # async def play_sweep(
     #    self,

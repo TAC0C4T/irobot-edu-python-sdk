@@ -1,5 +1,5 @@
 #
-# Licensed under 3-Clause BSD license available in the License file. Copyright (c) 2020-2022 iRobot Corporation. All rights reserved.
+# Licensed under 3-Clause BSD license available in the License file. Copyright (c) 2020-2024 iRobot Corporation. All rights reserved.
 #
 
 try:
@@ -8,14 +8,16 @@ try:
 except ImportError:
     import uasyncio as asyncio
 
+from enum import IntEnum
 from struct import pack, unpack
+from math import radians
 from .completer import Completer
 from .packet import Packet
 from .utils import bound, is_web
 from .color import Color
 from .backend.backend import Backend
 from .event import Event
-from .getter_types import Bumpers, TouchSensors, CliffSensor, MotorStall, Battery
+from .getter_types import Bumpers, TouchSensors, CliffSensor, MotorStall, Battery, Pose
 import signal
 import sys
 
@@ -33,32 +35,42 @@ class Robot:
     MAX_SPEED = 500  # cm/s
 
     # Direction.
-    DIR_LEFT = 0
-    DIR_RIGHT = 1
+    class Dir(IntEnum):
+        LEFT = 0
+        RIGHT = 1
 
     # LED lights.
-    LIGHT_OFF = 0
-    LIGHT_ON = 1
-    LIGHT_BLINK = 2
-    LIGHT_SPIN = 3
+    class LightPattern(IntEnum):
+        OFF = 0
+        ON = 1
+        BLINK = 2
+        SPIN = 3
 
     # For the stall event.
-    MOTOR_LEFT = 0
-    MOTOR_RIGHT = 1
-    MOTOR_MARKER = 2  # Reserved for robots with a physical marker.
-    ERROR_NO_STALL = 0
+    class StallMotor(IntEnum):
+        LEFT = 0
+        RIGHT = 1
+        MARKER = 2  # Reserved for robots with a physical marker.
 
-    ERROR_OVER_CURRENT = 1
-    ERROR_UNDER_CURRENT = 2
-    ERROR_UNDER_SPEED = 3
-    ERROR_SATURATED_PID = 4
-    ERROR_TIMEOUT = 5
+    class StallCause(IntEnum):
+        NO_STALL = 0
+        OVER_CURRENT = 1
+        UNDER_CURRENT = 2
+        UNDER_SPEED = 3
+        SATURATED_PID = 4
+        TIMEOUT = 5
+
+    # Empty class for containing robot-specific variables
+    class Vars:
+        pass
 
     def __init__(self, backend: Backend):
         self._backend = backend
         self.on_data_reception = getattr(self._backend, 'on_data_reception', None)  # Events based backend?
         if callable(self.on_data_reception):
             self.on_data_reception(self.data_reception)
+
+        self.pose = Pose()
 
         self._inc = 0
         self._run = False
@@ -92,7 +104,25 @@ class Robot:
 
         self.sound_enabled = True
 
+        # Whether or not the local pose estimate should use the robot's estimate or calculate locally
+        self.USE_ROBOT_POSE = False
+        # Default to no turn angle compensation
+        self._turn_scale_comp = 1.0 # percentage of turn to scale input
+        self._turn_bias_comp = 0.0  # percentage of absolute value of turn angle to add to turn
+
+        # Initialize class to hold robot-specific variables
+        self.vars = self.Vars()
+
+        # Catch all signals and direct to the _exit_handler
         signal.signal(signal.SIGINT, _exit_handler)
+        signal.signal(signal.SIGTERM, _exit_handler)
+
+        try:
+            signal.signal(signal.SIGTSTP, _exit_handler)
+            signal.signal(signal.SIGQUIT, _exit_handler)
+            signal.signal(signal.SIGHUP, _exit_handler)
+        except AttributeError:
+            pass # these signals do not exist in Windows
 
     def __enter__(self):
         return self
@@ -104,7 +134,8 @@ class Robot:
         """Ensures that the robot resets its state when the program is finished neatly."""
         if self._run and await self._backend.is_connected():
             await self.stop()
-        await self._backend.disconnect()
+            await self.disconnect()
+            await self._backend.disconnect()
 
     @property
     def inc(self):
@@ -181,17 +212,18 @@ class Robot:
 
     async def _when_motor_stalled_handler(self, packet: Packet):
         self._disable_motors = True
+        self.motor_stall.motor = packet.payload[4]
+        self.motor_stall.cause = packet.payload[5]
+
         for event in self._when_motor_stalled:
-            self.motor_stall.motor = packet.payload[4]
-            self.motor_stall.cause = packet.payload[5]
             await event.run(self)
 
     async def _when_bumped_handler(self, packet: Packet):
-        for event in self._when_bumped:
-            if len(packet.payload) > 4:
-                self.bumpers.left = packet.payload[4] & 0x80 != 0
-                self.bumpers.right = packet.payload[4] & 0x40 != 0
+        if len(packet.payload) > 4:
+            self.bumpers.left = packet.payload[4] & 0x80 != 0
+            self.bumpers.right = packet.payload[4] & 0x40 != 0
 
+            for event in self._when_bumped:
                 # An empty condition list means to trigger the event on every occurrence.
                 if (not event.condition and self.bumpers.left) or (not event.condition and self.bumpers.right):  # Any.
                     await event.run(self)
@@ -200,41 +232,58 @@ class Robot:
                     await event.run(self)
 
     async def _when_battery_handler(self, packet: Packet):
+        self.battery.millivolts = unpack('>H', packet.payload[4:6])[0]
+        self.battery.percent = packet.payload[6]
+
         for event in self._when_battery:
-            self.battery.millivolts = unpack('>H', packet.payload[4:6])[0]
-            self.battery.percent = packet.payload[6]
             # TODO: Add trigger? Probably not necessary.
             await event.run(self)
 
     async def _when_touched_handler(self, packet: Packet):
-        for event in self._when_touched:
-            if len(packet.payload) > 4:
-                self.touch_sensors.front_left = packet.payload[4] & 0x80 != 0
-                self.touch_sensors.front_right = packet.payload[4] & 0x40 != 0
-                self.touch_sensors.back_right = packet.payload[4] & 0x20 != 0
-                self.touch_sensors.back_left = packet.payload[4] & 0x10 != 0
+        if len(packet.payload) > 4:
+            self.touch_sensors.front_left = packet.payload[4] & 0x80 != 0
+            self.touch_sensors.front_right = packet.payload[4] & 0x40 != 0
+            self.touch_sensors.back_right = packet.payload[4] & 0x20 != 0
+            self.touch_sensors.back_left = packet.payload[4] & 0x10 != 0
+
+            for event in self._when_touched:
                 # An empty condition list means to trigger the event on every occurrence.
-                not_condition = not event.condition
-                any = (not_condition and self.touch_sensors.front_left) or (not_condition and self.touch_sensors.front_right) or (
-                    not_condition and self.touch_sensors.back_left) or (not_condition and self.touch_sensors.back_right)
+                any = (not event.condition) and (self.touch_sensors.front_left or self.touch_sensors.front_right or
+                                                 self.touch_sensors.back_left or self.touch_sensors.back_right)
                 if any:
                     await event.run(self)
                 elif len(event.condition) > 1 and len(event.condition) < 3:
-                    if any or ((event.condition[0] and self.touch_sensors.front_left) or
-                               (event.condition[1] and self.touch_sensors.front_right)):
+                    if (  (event.condition[0] and self.touch_sensors.front_left) or
+                          (event.condition[1] and self.touch_sensors.front_right)):
                         await event.run(self)
                 elif len(event.condition) > 3:
-                    if any or ((event.condition[0] and self.touch_sensors.front_left) or
-                               (event.condition[1] and self.touch_sensors.front_right) or
-                               (event.condition[2] and self.touch_sensors.back_left) or
-                               (event.condition[3] and self.touch_sensors.back_right)):
+                    if (  (event.condition[0] and self.touch_sensors.front_left) or
+                          (event.condition[1] and self.touch_sensors.front_right) or
+                          (event.condition[2] and self.touch_sensors.back_left) or
+                          (event.condition[3] and self.touch_sensors.back_right)):
                         await event.run(self)
 
     async def _when_cliff_sensor_handler(self, packet: Packet):
-        self.cliff_sensor.disable_motors = packet.payload[4] != 0
-        for event in self._when_cliff_sensor:
-            # TODO: Add trigger
-            await event.run(self)
+        if len(packet.payload) > 4:
+            self.cliff_sensor.disable_motors = packet.payload[4] != 0
+            self.cliff_sensor.right = packet.payload[4] & 0x01 != 0
+            self.cliff_sensor.front_right = packet.payload[4] & 0x02 != 0
+            self.cliff_sensor.front_left = packet.payload[4] & 0x04 != 0
+            self.cliff_sensor.left = packet.payload[4] & 0x08 != 0
+
+            for event in self._when_cliff_sensor:
+                # An empty condition list means to trigger the event on every occurrence.
+                if not event.condition and self.cliff_sensor.disable_motors:  # Any.
+                    await event.run(self)
+                elif len(event.condition) > 0 and len(event.condition) < 3:
+                    if (event.condition[0] == self.cliff_sensor.disable_motors):
+                        await event.run(self)
+                elif len(event.condition) > 3:
+                    if ((event.condition[0] and self.cliff_sensor.left) or
+                        (event.condition[1] and self.cliff_sensor.front_left) or
+                        (event.condition[2] and self.cliff_sensor.front_right) or
+                        (event.condition[3] and self.cliff_sensor.right)):
+                        await event.run(self)
 
     # Event Callbacks.
 
@@ -262,7 +311,7 @@ class Robot:
         """Register when touch callback of type: async def fn(front_left: bool, front_right: bool, back_left: bool, back_right: bool)."""
         self._when_touched.append(Event(condition, callback))
 
-    def when_cliff_sensor(self, condition: list[bool], callback: Callable[[bool], Awaitable[None]]):
+    def when_cliff_sensor(self, condition: list[bool, bool, bool, bool], callback: Callable[[bool], Awaitable[None]]):
         """Register when cliff callback of type: async def fn(over_cliff: bool)."""
         self._when_cliff_sensor.append(Event(condition, callback))
 
@@ -426,56 +475,128 @@ class Robot:
         completer = Completer()
         self._responses[(dev, cmd, inc)] = completer
         await self._backend.write_packet(packet)
-        await completer.wait(self.DEFAULT_TIMEOUT + int(abs(distance) / 10))
+        packet = await completer.wait(self.DEFAULT_TIMEOUT + int(abs(distance) / 10))
+        if self.USE_ROBOT_POSE and packet:
+            return self.pose.set_from_packet(packet)
+        else:
+            self.pose.move(distance)
+            return self.pose
 
-    async def turn_right(self, angle: Union[int, float]):
+    async def turn(self, direction: int, angle: Union[int, float]):
         """Rotate angle in degrees."""
         if self._disable_motors:
             return
+        if direction == self.Dir.LEFT:
+            angle = -angle
+
+        if self.USE_ROBOT_POSE == False:
+            angle *= self._turn_scale_comp
+            angle += abs(angle) * self._turn_bias_comp
+
         dev, cmd, inc = 1, 12, self.inc
         packet = Packet(dev, cmd, inc, pack('>i', int(angle * 10)))
         completer = Completer()
         self._responses[(dev, cmd, inc)] = completer
         await self._backend.write_packet(packet)
-        await completer.wait(self.DEFAULT_TIMEOUT + int(abs(angle) / 100))
+        packet = await completer.wait(self.DEFAULT_TIMEOUT + int(abs(angle) / 100))
+        if self.USE_ROBOT_POSE and packet:
+            return self.pose.set_from_packet(packet)
+        else:
+            self.pose.turn_left(-angle)
+            return self.pose
 
     async def turn_left(self, angle: Union[int, float]):
-        await self.turn_right(-angle)
+        return await self.turn(self.Dir.LEFT, angle)
+
+    async def turn_right(self, angle: Union[int, float]):
+        return await self.turn(self.Dir.RIGHT, angle)
+
+    async def reset_position(self): # this is the name of the command in the protocol doc
+        return await self.reset_navigation()
+
+    async def reset_navigation(self):
+        """Request that robot resets position and heading."""
+        if self.USE_ROBOT_POSE:
+            await self._backend.write_packet(Packet(1, 15, self.inc))
+        self.pose.set(0, 0, 90)
+
+    async def get_position(self):
+        """Get robot's position and heading.
+        Units:
+            x, y: cm
+            heading: deg
+        """
+        if self.USE_ROBOT_POSE:
+            dev, cmd, inc = 1, 16, self.inc
+            completer = Completer()
+            self._responses[(dev, cmd, inc)] = completer
+            await self._backend.write_packet(Packet(dev, cmd, inc))
+            packet = await completer.wait(self.DEFAULT_TIMEOUT)
+            return self.pose.set_from_packet(packet)
+        else:
+            return self.pose
 
     async def arc(self, direction: int, angle: Union[int, float], radius: Union[int, float]):
         """Drive arc defined by angle in degrees and radius in cm."""
         if self._disable_motors:
             return
         dev, cmd, inc = 1, 27, self.inc
-        if direction == Robot.DIR_LEFT:
+        if direction == Robot.Dir.LEFT:
             angle = -angle
             radius = -radius
         payload = pack('>ii', int(angle * 10), int(radius * 10))
         completer = Completer()
         self._responses[(dev, cmd, inc)] = completer
         await self._backend.write_packet(Packet(dev, cmd, inc, payload))
-        await completer.wait(self.DEFAULT_TIMEOUT + int(abs(radius * angle / 573)))
 
-    async def set_lights(self, animation: int, color: Color):
-        """Set roobt's LEDs to animation with color red, green, blue."""
-        animation = bound(animation, Robot.LIGHT_OFF, Robot.LIGHT_SPIN)
+        timeout = abs(radians(angle) * (abs(radius * 10) + 51.5)) / 100
+        packet = await completer.wait(15 + timeout)
+        if self.USE_ROBOT_POSE and packet:
+            return self.pose.set_from_packet(packet)
+        else:
+            return self.pose.arc(angle, radius)
+
+    async def arc_left(self, angle: Union[int, float], radius: Union[int, float]):
+        await self.arc(self.Dir.LEFT, angle, radius)
+
+    async def arc_right(self, angle: Union[int, float], radius: Union[int, float]):
+        await self.arc(self.Dir.RIGHT, angle, radius)
+
+    async def set_lights(self, animation: int, color: Color = Color(255, 255, 255)):
+        """Set robot's LEDs to animation with color red, green, blue."""
+        animation = bound(animation, Robot.LightPattern.OFF, Robot.LightPattern.SPIN)
         color.red = bound(color.red, 0, 255)
         color.green = bound(color.green, 0, 255)
         color.blue = bound(color.blue, 0, 255)
         payload = bytes([animation, color.red, color.green, color.blue])
         await self._backend.write_packet(Packet(3, 2, self.inc, payload))
 
+    async def set_lights_off(self):
+        await self.set_lights(Robot.LightPattern.OFF)
+
     async def set_lights_rgb(self, red: int, green: int, blue: int):
-        await self.set_lights(Robot.LIGHT_ON, Color(red, green, blue))
+        await self.set_lights(Robot.LightPattern.ON, Color(red, green, blue))
+
+    async def set_lights_on_rgb(self, red: int, green: int, blue: int):
+        await self.set_lights(Robot.LightPattern.ON, Color(red, green, blue))
+
+    async def set_lights_blink_rgb(self, red: int, green: int, blue: int):
+        await self.set_lights(Robot.LightPattern.BLINK, Color(red, green, blue))
+
+    async def set_lights_spin_rgb(self, red: int, green: int, blue: int):
+        await self.set_lights(Robot.LightPattern.SPIN, Color(red, green, blue))
 
     async def play_note(self, frequency: Union[float, int], duration: Union[float, int]):
         """Play note with frequency in hertz for duration in seconds."""
         dev, cmd, inc = 5, 0, self.inc
-        payload = pack('>IH', abs(frequency), abs(int(duration * 1000)))
+        payload = pack('>IH', abs(int(frequency)), abs(int(duration * 1000)))
         completer = Completer()
         self._responses[(dev, cmd, inc)] = completer
         await self._backend.write_packet(Packet(dev, cmd, inc, payload))
         await completer.wait(int(abs(duration)))
+
+    async def play_tone(self, frequency: Union[float, int], duration: Union[float, int]):
+        await self.play_note(frequency, duration)
 
     # async def play_sweep(
     #    self,
@@ -524,6 +645,16 @@ class Robot:
                 await completer.wait(self.DEFAULT_TIMEOUT + len(payload))
                 break
 
+    def get_bumpers_cached(self):
+        '''Returns tuple of most recently seen bumper state, or None if no event has happened yet'''
+        return (self.bumpers.left, self.bumpers.right)
+
+    async def get_bumpers(self):
+        '''Returns tuple of most recently seen bumper state, or None if no event has happened yet.
+           If there were a protocol getter, this would await that response when the cache is empty.
+        '''
+        return self.get_bumpers_cached()
+
     async def get_accelerometer(self):
         """Get instantaneous accelerometer values"""
         dev, cmd, inc = 16, 1, self.inc
@@ -538,3 +669,14 @@ class Robot:
             (x,y,z) = unpack('>hhh', payload[4:10])
             return (x,y,z)
         return None
+
+    def get_touch_sensors_cached(self):
+        '''Returns tuple of most recently seen touch sensor state, or None if no event has happened yet'''
+        return (self.touch_sensors.front_left, self.touch_sensors.front_right,
+                self.touch_sensors.back_left,  self.touch_sensors.back_right)
+
+    async def get_touch_sensors(self):
+        '''Returns tuple of most recently seen touch sensor state, or None if no event has happened yet.
+           If there were a protocol getter, this would await that response when the cache is empty.
+        '''
+        return self.get_touch_sensors_cached()

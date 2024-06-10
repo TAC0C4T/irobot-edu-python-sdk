@@ -1,38 +1,73 @@
 #
-# Licensed under 3-Clause BSD license available in the License file. Copyright (c) 2020-2022 iRobot Corporation. All rights reserved.
+# Licensed under 3-Clause BSD license available in the License file. Copyright (c) 2020-2024 iRobot Corporation. All rights reserved.
 #
 
 import math
-from typing import Union
+from enum import IntEnum, IntFlag
+from typing import Union, Callable, Awaitable, List
 from struct import pack, unpack
 from .backend.backend import Backend
+from .event import Event
 from .completer import Completer
 from .packet import Packet
 from .utils import bound
-from .getter_types import IPv4Addresses, IrProximity, Pose
-from irobot_edu_sdk.robot import Robot
+from .getter_types import IPv4Addresses, IrProximity, Pose, DockingSensor
+from .robot import Robot
 
 
 class Create3(Robot):
     """Create 3 robot object."""
 
-    DOCK_STATUS_SUCCEEDED = 0
-    DOCK_STATUS_ABORTED   = 1
-    DOCK_STATUS_CANCELED  = 2
-    DOCK_RESULT_UNDOCKED = 0
-    DOCK_RESULT_DOCKED   = 1
+    class DockStatus(IntEnum):
+        SUCCEEDED = 0
+        ABORTED   = 1
+        CANCELED  = 2
+
+    class DockResult(IntEnum):
+        UNDOCKED = 0
+        DOCKED   = 1
+
 
     def __init__(self, backend: Backend):
         super().__init__(backend=backend)
 
+        self._events[(19, 0)] = self._when_docking_sensor_handler
+
+        self._when_docking_sensor: list[Event] = []
+
         # Getters.
         self.ipv4_address = IPv4Addresses()
+        self.docking_sensor = DockingSensor()
+
+        # Use Create 3 robot's internal position estimate
+        self.USE_ROBOT_POSE = True
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         pass
+
+    # Event Handlers.
+
+    async def _when_docking_sensor_handler(self, packet):
+        if len(packet.payload) > 4:
+            self.docking_sensor.contacts = packet.payload[4] != 0
+            self.docking_sensor.sensors = (packet.payload[5],
+                                           packet.payload[6],
+                                           packet.payload[7])
+
+            for event in self._when_docking_sensor:
+                # TODO: Generate triggers instead of just firing for any event
+                # TODO: Define dock sensor Enum
+                await event.run(self)
+
+    # Event Callbacks.
+
+    def when_docking_sensor(self, callback: Callable[[bool], Awaitable[None]]):
+        self._when_docking_sensor.append(Event(True, callback))
+
+    # Commands.
 
     async def get_ipv4_address(self) -> IPv4Addresses:
         """Get the robot's ipv4 address as a IPv4Addresses, which contains wlan0, wlan1 and usb0. Returns None if anything went wrong."""
@@ -48,7 +83,8 @@ class Create3(Robot):
             return self.ipv4_address
         return None
 
-    async def get_ir_proximity(self):
+    async def get_6x_ir_proximity(self):
+        """Get Original IR Proximity Values and States"""
         dev, cmd, inc = 11, 1, self.inc
         completer = Completer()
         self._responses[(dev, cmd, inc)] = completer
@@ -62,6 +98,11 @@ class Create3(Robot):
         return None
 
     async def get_packed_ir_proximity(self):
+        """DEPRECATED function for new Get IR Proximity Values and States"""
+        print('Warning: get_packed_ir_proximity() has been deprecated, please use get_ir_proximity() instead')
+        await self.get_7x_ir_proximity()
+
+    async def get_7x_ir_proximity(self):
         """Get Packed IR Proximity Values and States"""
         dev, cmd, inc = 11, 2, self.inc
         completer = Completer()
@@ -85,23 +126,19 @@ class Create3(Robot):
             return ir_proximity
         return None
 
-    async def get_position(self):
-        dev, cmd, inc = 1, 16, self.inc
-        completer = Completer()
-        self._responses[(dev, cmd, inc)] = completer
-        await self._backend.write_packet(Packet(dev, cmd, inc))
-        packet = await completer.wait(self.DEFAULT_TIMEOUT)
-        if packet:
-            payload = packet.payload
-            timestamp = unpack('>I', payload[0:4])[0]
-            x = unpack('>i', payload[4:8])[0]
-            y = unpack('>i', payload[8:12])[0]
-            heading = unpack('>h', payload[12:14])[0] / 10
-            return Pose(x, y, heading)
-        return None
+    async def get_ir_proximity(self):
+        """Version-Agnostic Get IR Proximity Values and States"""
+        ir_prox = await self.get_7x_ir_proximity()
+        if ir_prox is not None:
+            return ir_prox
 
-    async def reset_navigation(self):
-        await self._backend.write_packet(Packet(1, 15, self.inc))
+        ir_prox = await self.get_6x_ir_proximity()
+        if ir_prox is not None:
+            print('Warning: ir_prox() missing seventh value; you may need to update your robot')
+            ir_prox.sensors.append(float('nan'))
+            return ir_prox
+
+        return None
 
     async def navigate_to(self, x: Union[int, float], y: Union[int, float], heading: Union[int, float] = None):
         """ If heading is None, then it will be ignored, and the robot will arrive to its destination
@@ -110,6 +147,7 @@ class Create3(Robot):
             x, y: cm
             heading: deg
         """
+
         if self._disable_motors:
             return
         dev, cmd, inc = 1, 17, self.inc
@@ -122,7 +160,16 @@ class Create3(Robot):
         self._responses[(dev, cmd, inc)] = completer
         await self._backend.write_packet(Packet(dev, cmd, inc, payload))
         timeout = self.DEFAULT_TIMEOUT + int(math.sqrt(x * x + y * y) / 10) + 4  # 4 is the timeout for a potential rotation.
-        await completer.wait(timeout)
+        packet = await completer.wait(timeout)
+        if self.USE_ROBOT_POSE and packet:
+            return self.pose.set_from_packet(packet)
+        else:
+            if heading is not None:
+                self.pose.set(x, y, heading)
+            else:
+                self.pose.set(x, y, math.degrees(math.atan2(y - self.pose.y, x - self.pose.x)) + self.pose.heading)
+
+            return self.pose
 
     async def dock(self):
         """Request a docking action."""
@@ -133,7 +180,7 @@ class Create3(Robot):
         packet = await completer.wait(60)
         if packet:
             unpacked = unpack('>IBBHHHHH', packet.payload)
-            return {'timestamp': unpacked[0], 'status': unpacked[1], 'result': unpacked[2]}
+            return {'timestamp': unpacked[0], 'status': self.DockStatus(unpacked[1]), 'result': self.DockResult(unpacked[2])}
         return None
 
     async def undock(self):
@@ -145,11 +192,12 @@ class Create3(Robot):
         packet = await completer.wait(30)
         if packet:
             unpacked = unpack('>IBBHHHHH', packet.payload)
-            return {'timestamp': unpacked[0], 'status': unpacked[1], 'result': unpacked[2]}
+            return {'timestamp': unpacked[0], 'status': self.DockStatus(unpacked[1]), 'result': self.DockResult(unpacked[2])}
         return None
 
     async def get_docking_values(self):
         """Get docking values."""
+        # TODO: Harmonize access with cached value from events
         dev, cmd, inc = 19, 1, self.inc
         completer = Completer()
         self._responses[(dev, cmd, inc)] = completer
@@ -173,6 +221,21 @@ class Create3(Robot):
             else:
                 major = chr(major)
 
-            return '.'.join([major, str(ver[2]), str(ver[9])])
+            return '.'.join([major, str(minor), str(patch)])
         except IndexError:
-            return None;
+            return None
+
+    def get_touch_sensors_cached(self):
+        '''Returns list of most recently seen touch sensor state, or None if no event has happened yet'''
+        return super().get_touch_sensors_cached()[0:2]
+
+    def get_cliff_sensors_cached(self):
+        '''Returns tuple of most recently seen cliff sensor state'''
+        return (self.cliff_sensor.left, self.cliff_sensor.front_left,
+                self.cliff_sensor.front_right, self.cliff_sensor.right)
+
+    async def get_cliff_sensors(self):
+        '''Returns tuple of most recently seen cliff sensor state.
+           If there were a protocol getter, this would await that response when the cache is empty.
+        '''
+        return self.get_cliff_sensors_cached()
